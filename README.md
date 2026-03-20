@@ -79,8 +79,6 @@ DyCFish-Gym/
         └── video3.mp4
 ``` -->
 
----
-
 ## 📚 Getting Started
 
 ### Prerequisites
