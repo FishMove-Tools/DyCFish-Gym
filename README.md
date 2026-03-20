@@ -8,7 +8,7 @@
 </div>
 
 <p align="center">
-  <em>An Intelligent Control Platform Bridging Reduced-Order Dynamics and Computational Fluid Dynamics for Thunniform Propulsion</em>
+  <em>An Intelligent Control Platform Bridging Reduced-Order Dynamics and Computational Fluid Dynamics for Propulsion</em>
 </p>
 
 <p align="center">
