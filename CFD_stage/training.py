@@ -129,6 +129,7 @@ class CallbackLogic:
         verbose: int = 1,
     ) -> None:
         super().__init__(verbose)
+        self.should_stop = False
         self.save_path = save_path
         self.rank = rank
         self.manager = manager
@@ -270,9 +271,13 @@ class CallbackLogic:
             self.current_episode_reward += float(reward)
             if done:
                 self._handle_episode_end(info)
+                if self.should_stop:
+                    return False
 
         except Exception as e:
             print(f"Error in callback for rank {self.rank}: {e}")
+            self.should_stop = True
+            self.manager.update_worker_status(self.rank, SharedTrainingManager.STATUS_ERROR)
             return False
 
         return True
@@ -299,6 +304,7 @@ class CallbackLogic:
             self.consecutive_failures = 0
 
         if self.consecutive_failures >= self.max_consecutive_failures:
+            self.should_stop = True
             print(
                 f"[Rank {self.rank}] Too many consecutive failures; "
                 f"marking worker as errored."
@@ -458,8 +464,12 @@ def train_with_rank(rank, manager, settings):
         model.learn(total_timesteps=settings["timesteps"], callback=callback)
         model.save(str(save_path / "final_model.zip"))
         env.save(str(save_path / "final_model.vecnormalize.pkl"))
-        manager.update_worker_status(rank, SharedTrainingManager.STATUS_DONE)
-        print(f"Worker {rank}: training completed.")
+        if callback.should_stop:
+            manager.update_worker_status(rank, SharedTrainingManager.STATUS_ERROR)
+            print(f"Worker {rank}: stopped after repeated solver failures.")
+        else:
+            manager.update_worker_status(rank, SharedTrainingManager.STATUS_DONE)
+            print(f"Worker {rank}: training completed.")
     except KeyboardInterrupt:
         if model is not None and env is not None:
             model.save(str(save_path / "interrupted_model.zip"))
