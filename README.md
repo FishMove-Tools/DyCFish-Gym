@@ -23,14 +23,12 @@
 ---
 
 ## 📋 Contents
+
 - [🏠 About](#-about)
-- [📁 Project Structure](#-project-structure)
 - [📚 Getting Started](#-getting-started)
 - [🚀 Usage](#-usage)
 - [📦 Benchmark & Method](#-benchmark--method)
 - [📝 TODO List](#-todo-list)
-- [🔗 Citation](#-citation)
-- [📄 License](#-license)
 - [👏 Acknowledgements](#-acknowledgements)
 
 ---
@@ -44,7 +42,8 @@ Training a DRL agent entirely within full-order CFD solvers requires millions of
 1. **Stage 1 — ROM Pre-training:** A reduced-order articulated dynamics model enables rapid policy pretraining. The ROM captures essential degrees of freedom (body + tail joint) with CPG-parameterized actuation, enabling >10³ simulation steps per second.
 2. **Stage 2 — CFD Fine-tuning:** The pretrained policy is transferred to a high-fidelity CFD environment (ANSYS Fluent) via the PyFluent interface for refinement under fully resolved Navier–Stokes equations. This stage accounts for only 10–15% of total training time.
 
-The platform is systematically validated across **three representative closed-loop tasks**:
+The manuscript evaluates the framework across **three representative closed-loop tasks**:
+
 - 🎯 **Trajectory tracking** — straight-line, semicircular, and W-shaped paths
 - 🏃 **Rapid escape** — predator evasion via C-start mechanism reconstruction
 - ⚓ **Station-keeping** — maintaining position against uniform inflow disturbances
@@ -52,7 +51,7 @@ The platform is systematically validated across **three representative closed-lo
 Key features include:
 
 * **🧬 Biologically Interpretable Behaviors:** The DRL agent autonomously learns bio-inspired mechanisms, such as exploiting reverse Kármán vortices to minimize cost of transport (COT).
-* **📊 Outperforms Classical Controllers:** 40% lower trajectory error, 30% smaller steady-state deviation, and 20% lower energy cost relative to PID and MPC baselines.
+* **📊 Outperforms Classical Controllers:** 40% lower trajectory error, 38% smaller steady-state deviation, and 25% lower energy cost relative to PID (manuscript Table 4).
 * **🤖 Sim-to-Real Transfer:** Learned policies are successfully deployed on a physical dual-joint robotic fish for trajectory tracking experiments.
 
 ---
@@ -120,7 +119,7 @@ pip install pandas==2.2.2
 #### 2. Clone the Repository
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/DyCFish-Gym.git
+git clone https://github.com/FishMove-Tools/DyCFish-Gym.git
 cd DyCFish-Gym
 ```
 
@@ -162,6 +161,7 @@ python train.py
 ```
 
 This will:
+
 - Launch the `FishEnv` environment with real-time Pygame rendering
 - Train a PPO agent for 1,000,000 timesteps
 - Save model checkpoints every 10,000 steps to `./models/`
@@ -185,21 +185,25 @@ This loads a trained model, runs 5 evaluation episodes, and saves the results as
 
 ### Stage 2: CFD Fine-tuning
 
-The second stage fine-tunes the pretrained policy in a high-fidelity ANSYS Fluent CFD environment.
+The CFD training script runs a target-navigation environment in ANSYS Fluent, with multi-worker training and checkpoint resume.
 
 > ⚠️ **Note:** ANSYS Fluent must be installed and properly configured before running this stage.
 
-**Run CFD training:**
+**Run CFD training from the repository root:**
 
 ```bash
-cd CFD_stage
-python training.py
+python -m CFD_stage.training --target 2 0 --initializer my_case:initialize
 ```
 
+`my_case:initialize` denotes the case-specific initialization function; replace it with your module and function name. Use `--help` for training options.
+
 This will:
+
 - Launch ANSYS Fluent (double-precision 2D solver, 6 processors)
-- Train with multi-worker support and automatic checkpoint resume
-- Save models with local/global best tracking to `./saved_models/`
+- Validate initialization settings, actions and solver states
+- Train with multi-worker support and resume matching model/normalization checkpoints
+- Save models with local/global best tracking by raw episode return to `./saved_models/`
+- Stop training after repeated solver failures
 - Log detailed performance metrics per episode
 
 ---
@@ -219,21 +223,28 @@ DyCFish-Gym is organized into four tightly coupled functional modules:
 
 ### Environment Specifications
 
+The table describes the provided ROM escape and CFD target-navigation examples. Task-augmented observations in the manuscript are task-specific; these example interfaces are not interchangeable for direct policy transfer.
+
 | Parameter | Dynamic Stage (`FishEnv`) | CFD Stage (`FluentEnv`) |
 | :--- | :--- | :--- |
-| **Observation** | 7D: [*x, y, ψ, vx, vy, ωz, t*] | 7D: [*x, y, θ, vx, vy, ωz, t*] |
-| **Action** | 2D: [*amplitude, frequency*] | 2D: [*frequency, amplitude*] |
+| **Observation** | 7D: `[x,y,yaw,vbx,vby,wz,t]`; body-frame linear velocities | 7D: `[x,y,yaw,vx_world,vy_world,wz,t]`; world-frame linear velocities |
+| **Action** | `[A,omega]`: A∈[0,π/4] rad, omega∈[π,2π] rad/s (f=omega/(2π)) | `[f,A]`: 0<f≤2 Hz, A∈[0,π/4] rad |
 | **Physics** | Reduced-order articulated dynamics | Unsteady Navier–Stokes (Fluent) |
-| **Speed** | >10³ steps/s | ~50 steps/s |
+| **Action interval** | 0.01 s by default | Up to one period (1/f), within the solver-step budget |
+
+In the CFD wrapper, A maps to the UDF turning coefficient `at` in [0,0.14].
 
 
 ### Baseline Comparison
 
-| Method | Trajectory Tracking RMSE | Station-keeping Deviation | Escape Success | Energy Cost |
-| :--- | :--- | :--- | :--- | :--- |
-| PID | 1.00 | 1.00 | 0.82 | 1.00 |
-| MPC | 0.78 | 0.83 | 0.87 | 0.92 |
-| **DyCFish-Gym** | **0.60** | **0.68** | **0.96** | **0.78** |
+Values from manuscript **Table 4**, reported as mean ± standard deviation over ten independent trials. Tracking error, station-keeping deviation and energy cost are normalized by the corresponding PID mean; escape success is unnormalized.
+
+| Method | Trajectory Tracking RMSE | Station-keeping Deviation | Escape Success | Energy Cost | Training Cost (core-hours) |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| PID | 1.00 | 1.00 | 0.82 ± 0.02 | 1.00 | — |
+| MPC | 0.78 ± 0.04 | 0.83 ± 0.03 | 0.87 ± 0.04 | 0.92 ± 0.01 | — |
+| CFD-only | 0.65 ± 0.02 | 0.69 ± 0.03 | 0.94 ± 0.02 | 0.76 ± 0.04 | 276 ± 5 |
+| **DyCFish-Gym** | **0.60 ± 0.04** | **0.62 ± 0.02** | **0.96 ± 0.01** | **0.75 ± 0.04** | **22 ± 1** |
 
 <!-- ### Demo Videos
 
@@ -255,6 +266,7 @@ DyCFish-Gym is organized into four tightly coupled functional modules:
 ---
 
 ## 📝 TODO List
+
 - \[x\] Release CFD_stage training code.
 - \[x\] Release dynamic_stage code.
 - \[\] Release the demo videos.
