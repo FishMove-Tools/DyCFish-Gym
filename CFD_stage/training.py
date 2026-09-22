@@ -1,16 +1,20 @@
-"""Multi-worker PPO training loop with checkpoint resumption.
+"""Multi-worker PPO training with explicit Fluent setup.
 
 This script orchestrates distributed reinforcement-learning training for
-the fish escape task.  Each worker launches its own ANSYS Fluent instance,
+the explicitly configured CFD target task.  Each worker launches its own ANSYS Fluent instance,
 trains a PPO agent, and shares best-model information through a
 :class:`SharedTrainingManager` backed by ``multiprocessing`` primitives.
 """
 
 from __future__ import annotations
 
+import argparse
 import csv
+import importlib
+import math
+from pathlib import Path
+import sys
 import os
-import shutil
 import time
 import traceback
 from typing import Any, Dict, List, Optional
@@ -18,13 +22,41 @@ from typing import Any, Dict, List, Optional
 import multiprocessing as mp
 
 import numpy as np
-import torch
-from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from CFD_stage.interface import interface_contract
 
-from EnvFluent import FluentEnv
+
+def positive_int(value):
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("Must be a positive integer.")
+    return parsed
+
+
+def resolve_initializer(spec):
+    """Resolve the user-supplied complete Fluent setup/reset callback."""
+    if ":" not in spec:
+        raise ValueError("--initializer must have the form module:function.")
+    module_name, function_name = spec.rsplit(":", 1)
+    if not module_name or not function_name:
+        raise ValueError("--initializer must have the form module:function.")
+    callback = getattr(importlib.import_module(module_name), function_name)
+    if not callable(callback):
+        raise ValueError("The specified initializer is not callable.")
+    return callback
+
+
+def cfd_contract(target, initializer):
+    return {**interface_contract(),
+            "target_position": list(target), "initializer": initializer}
+
+
+
+
+
+
 
 
 class SharedTrainingManager:
@@ -81,7 +113,7 @@ class SharedTrainingManager:
             return self.best_reward.value
 
 
-class EnhancedCallback(BaseCallback):
+class CallbackLogic:
     """PPO callback that logs per-episode statistics and manages checkpoints.
 
     At the end of every episode the callback saves snapshots, updates
@@ -153,27 +185,24 @@ class EnhancedCallback(BaseCallback):
             self.save_path, "saved_vecnormalize.pkl"
         )
         self.global_saved_model = os.path.join(
-            "./saved_models", "saved_model.zip"
+            str(Path(self.save_path).parent), "saved_model.zip"
         )
         self.global_saved_vecnorm = os.path.join(
-            "./saved_models", "saved_vecnormalize.pkl"
+            str(Path(self.save_path).parent), "saved_vecnormalize.pkl"
         )
-        os.makedirs("./saved_models", exist_ok=True)
+        Path(self.save_path).parent.mkdir(parents=True, exist_ok=True)
 
-    def _save_checkpoint(
-        self, model_path: str, vecnorm_path: str
-    ) -> None:
-        """Save the model and ``VecNormalize`` statistics to disk."""
+    def _save_checkpoint(self, model_path, vecnorm_path):
+        """Save the model and its current normalization statistics."""
         self.model.save(model_path)
-        try:
-            vecnorm = self.model.get_vec_normalize_env()
-            if vecnorm is not None:
-                vecnorm.save(vecnorm_path)
-        except Exception as e:
-            print(
-                f"[Rank {self.rank}] Warning: "
-                f"failed to save VecNormalize: {e}"
-            )
+        vecnorm = self.model.get_vec_normalize_env()
+        if vecnorm is not None:
+            vecnorm.save(vecnorm_path)
+
+    def _on_training_end(self):
+        if self.episode_file is not None:
+            self.episode_file.close()
+            self.episode_file = None
 
     def _on_step(self) -> bool:  # noqa: C901
         """Called after every environment step."""
@@ -195,7 +224,7 @@ class EnhancedCallback(BaseCallback):
                     fieldnames=[
                         "step", "simulation_time", "fish_x", "fish_y",
                         "fish_theta", "turning_action", "period_action",
-                        "obstacle_distance", "target_distance", "reward",
+                        "obstacle_distance", "target_distance", "normalized_reward",
                         "success", "failed", "failure_reason",
                     ],
                 )
@@ -232,14 +261,13 @@ class EnhancedCallback(BaseCallback):
                 "period_action": period_action,
                 "obstacle_distance": obstacle_distance,
                 "target_distance": info.get("target_distance", float("inf")),
-                "reward": float(reward),
+                "normalized_reward": float(reward),
                 "success": info.get("success", False),
                 "failed": info.get("failed", False),
                 "failure_reason": info.get("failure_reason", ""),
             })
 
-            self.current_episode_reward += reward
-
+            self.current_episode_reward += float(reward)
             if done:
                 self._handle_episode_end(info)
 
@@ -295,7 +323,7 @@ class EnhancedCallback(BaseCallback):
             self.save_path,
             f"model_rank{self.rank}_ep{self.episode_count}.zip",
         )
-        self.model.save(model_path)
+        self._save_checkpoint(model_path, str(Path(model_path).with_suffix(".vecnormalize.pkl")))
 
         # Update local / global best checkpoints
         best_status = ""
@@ -376,297 +404,129 @@ class EnhancedCallback(BaseCallback):
         self.current_episode_reward = 0.0
 
 
-def build_env_with_optional_resume(
-    rank: int,
-    log_path: str,
-    norm_obs: bool = True,
-    norm_reward: bool = True,
-    clip_obs: float = 10.0,
-    local_saved_vecnorm: Optional[str] = None,
-    global_saved_vecnorm: Optional[str] = None,
-) -> VecNormalize:
-    """Create and optionally restore a ``VecNormalize``-wrapped environment.
+def create_callback(*args, **kwargs):
+    # Keep import/CLI inspection safe without importing or starting PPO.
+    from stable_baselines3.common.callbacks import BaseCallback
 
-    Attempts to reload statistics in priority order: local checkpoint,
-    global checkpoint, then fresh wrapper.
-    """
+    class EnhancedCallback(CallbackLogic, BaseCallback):
+        pass
+
+    return EnhancedCallback(*args, **kwargs)
+
+
+def build_env(rank, log_path, env_kwargs):
+    from stable_baselines3.common.monitor import Monitor
+    from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+    from CFD_stage.EnvFluent import FluentEnv
 
     def make_env():
-        def _init():
-            env = FluentEnv(max_steps=800, simu_name=f"CFD_{rank}")
-            return Monitor(env, os.path.join(log_path, "monitor"))
-        return _init
+        return Monitor(FluentEnv(max_steps=800, simu_name=f"CFD_{rank}", **env_kwargs),
+                       str(Path(log_path) / "monitor"))
 
-    base_env = DummyVecEnv([make_env()])
-
-    if local_saved_vecnorm and os.path.exists(local_saved_vecnorm):
-        print(f"Worker {rank}: Loading VecNormalize from {local_saved_vecnorm}")
-        env = VecNormalize.load(local_saved_vecnorm, base_env)
-        env.training = True
-    elif global_saved_vecnorm and os.path.exists(global_saved_vecnorm):
-        print(
-            f"Worker {rank}: Loading GLOBAL VecNormalize "
-            f"from {global_saved_vecnorm}"
-        )
-        env = VecNormalize.load(global_saved_vecnorm, base_env)
-        env.training = True
-    else:
-        env = VecNormalize(
-            base_env,
-            norm_obs=norm_obs,
-            norm_reward=norm_reward,
-            clip_obs=clip_obs,
-        )
-
-    return env
+    return VecNormalize(DummyVecEnv([make_env]), norm_obs=True, norm_reward=True, clip_obs=10.0)
 
 
-def train_with_rank(
-    rank: int,
-    num_workers: int,
-    manager: SharedTrainingManager,
-    total_timesteps: int,
-    use_lstm: bool = False,
-) -> None:
-    """Train a PPO agent on a single Fluent instance.
+def train_with_rank(rank, manager, settings):
+    """Train the explicitly configured CFD target task."""
+    import torch
+    from stable_baselines3 import PPO
 
-    Handles staggered startup, checkpoint resumption, and graceful shutdown.
-    """
-    env: Optional[VecNormalize] = None
-    model: Optional[PPO] = None
-    save_path = os.path.join("./saved_models", f"worker_{rank}")
-
+    env, model, callback = None, None, None
+    output_dir = Path(settings["output_dir"])
+    save_path = output_dir / "saved_models" / f"worker_{rank}"
+    log_path = output_dir / "logs" / f"worker_{rank}"
+    seed = settings["seed"] + rank * 42
     try:
-        # Stagger startup to avoid resource contention
-        startup_delay = rank * 30
-        print(f"Worker {rank}: Waiting {startup_delay}s before launch...")
-        time.sleep(startup_delay)
-
         manager.update_worker_status(rank, SharedTrainingManager.STATUS_RUNNING)
-
-        # Seed for reproducibility
-        torch.manual_seed(rank * 42)
-        np.random.seed(rank * 42)
-
-        # Directory setup
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        log_path = os.path.join("./logs", f"worker_{rank}")
-        os.makedirs(save_path, exist_ok=True)
-        os.makedirs(log_path, exist_ok=True)
-
-        # Checkpoint paths
-        local_saved_model = os.path.join(save_path, "saved_model.zip")
-        local_saved_vecnorm = os.path.join(save_path, "saved_vecnormalize.pkl")
-        global_saved_model = os.path.join("./saved_models", "saved_model.zip")
-        global_saved_vecnorm = os.path.join(
-            "./saved_models", "saved_vecnormalize.pkl"
-        )
-
-        # Build environment
-        env = build_env_with_optional_resume(
-            rank,
-            log_path,
-            norm_obs=True,
-            norm_reward=True,
-            clip_obs=10.0,
-            local_saved_vecnorm=local_saved_vecnorm,
-            global_saved_vecnorm=global_saved_vecnorm,
-        )
-
-        # Network architecture
-        if use_lstm:
-            policy_kwargs: Dict[str, Any] = dict(
-                net_arch=dict(pi=[1024, 512, 256], vf=[512, 256, 128]),
-                lstm_hidden_size=256,
-                enable_critic_lstm=True,
-                lstm_layers=2,
-            )
-            policy_type = "MlpLstmPolicy"
-        else:
-            policy_kwargs = dict(
-                net_arch=dict(pi=[1024, 512, 256], vf=[512, 256, 128]),
-                activation_fn=torch.nn.ReLU,
-            )
-            policy_type = "MlpPolicy"
-
-        # Resume from checkpoint or create a fresh model
-        if os.path.exists(local_saved_model):
-            print(f"Worker {rank}: Resuming from {local_saved_model}")
-            model = PPO.load(local_saved_model, env=env, device=device)
-        elif os.path.exists(global_saved_model):
-            print(f"Worker {rank}: Resuming from GLOBAL {global_saved_model}")
-            model = PPO.load(global_saved_model, env=env, device=device)
-        else:
-            model = PPO(
-                policy_type,
-                env,
-                policy_kwargs=policy_kwargs,
-                learning_rate=3e-4,
-                n_steps=32,
-                batch_size=16,
-                n_epochs=10,
-                gamma=0.995,
-                gae_lambda=0.98,
-                clip_range=0.2,
-                ent_coef=0.005,
-                vf_coef=0.5,
-                max_grad_norm=0.5,
-                verbose=0,
-                tensorboard_log=log_path,
-                device=device,
-            )
-
-        # Create callback and start training
-        callback = EnhancedCallback(save_path, rank, manager, verbose=1)
-
-        print(f"Worker {rank}: Starting training for {total_timesteps} steps")
-        print(
-            f"Worker {rank}: Observation space: {env.observation_space}"
-        )
-        print(f"Worker {rank}: Action space: {env.action_space}")
-
-        model.learn(
-            total_timesteps=total_timesteps,
-            callback=callback,
-            reset_num_timesteps=False,
-        )
-
-        # Save final model and normalisation statistics
-        final_path = os.path.join(save_path, "final_model.zip")
-        model.save(final_path)
-        try:
-            env.save(os.path.join(save_path, "vec_normalize.pkl"))
-        except Exception as e:
-            print(f"Worker {rank}: Warning saving vec_normalize.pkl: {e}")
-
+        time.sleep(rank * 30)
+        for folder in (save_path, log_path):
+            folder.mkdir(parents=True, exist_ok=True)
+        initializer = resolve_initializer(settings["initializer"])
+        env = build_env(rank, log_path,
+            {"target_position": tuple(settings["target"]), "reward_function": "target",
+             "initializer": initializer, "work_dir": output_dir / "runs" / f"CFD_{rank}"})
+        env.seed(seed)
+        model = PPO("MlpPolicy", env,
+            policy_kwargs=dict(net_arch=dict(pi=[1024, 512, 256], vf=[512, 256, 128]),
+                               activation_fn=torch.nn.ReLU),
+            learning_rate=3e-4, n_steps=32, batch_size=16, n_epochs=10,
+            gamma=0.995, gae_lambda=0.98, clip_range=0.2, ent_coef=0.005,
+            vf_coef=0.5, max_grad_norm=0.5, verbose=0,
+            tensorboard_log=str(log_path),
+            device=torch.device("cuda" if torch.cuda.is_available() else "cpu"), seed=seed)
+        callback = create_callback(str(save_path), rank, manager)
+        model.learn(total_timesteps=settings["timesteps"], callback=callback)
+        model.save(str(save_path / "final_model.zip"))
+        env.save(str(save_path / "final_model.vecnormalize.pkl"))
         manager.update_worker_status(rank, SharedTrainingManager.STATUS_DONE)
-        print(f"Worker {rank}: Training completed successfully")
-
+        print(f"Worker {rank}: training completed.")
     except KeyboardInterrupt:
-        print(f"Worker {rank}: Interrupted. Saving backup...")
-        try:
-            backup_path = os.path.join(save_path, "interrupted_model.zip")
-            if model is not None:
-                model.save(backup_path)
-        except Exception:
-            pass
+        if model is not None and env is not None:
+            model.save(str(save_path / "interrupted_model.zip"))
+            env.save(str(save_path / "interrupted_model.vecnormalize.pkl"))
         manager.update_worker_status(rank, SharedTrainingManager.STATUS_ERROR)
-
-    except Exception as e:
-        print(f"Worker {rank}: Error: {e}")
+    except Exception as error:
+        print(f"Worker {rank}: {error}")
         traceback.print_exc()
         manager.update_worker_status(rank, SharedTrainingManager.STATUS_ERROR)
-
     finally:
+        if callback is not None:
+            callback._on_training_end()
         if env is not None:
-            try:
-                env.close()
-                print(f"Worker {rank}: Environment closed")
-            except Exception as e:
-                print(f"Worker {rank}: Error closing environment: {e}")
+            env.close()
 
 
-def monitor_workers(
-    manager: SharedTrainingManager,
-    num_workers: int,
-    check_interval: int = 60,
-) -> None:
-    """Periodically report worker status until all workers finish."""
-    status_labels = ["Not started", "Running", "Error", "Done"]
-
-    while True:
-        time.sleep(check_interval)
-
-        status_counts = [0, 0, 0, 0]
-        for i in range(num_workers):
-            status_counts[manager.worker_status[i]] += 1
-
-        print("\n=== Worker Status Monitor ===")
-        for label, count in zip(status_labels, status_counts):
-            print(f"  {label}: {count}")
-        print(f"  Global best reward: {manager.get_best_reward():.2f}")
-
-        # Exit when no workers are running
-        if status_counts[SharedTrainingManager.STATUS_RUNNING] == 0:
-            print("All workers have stopped.")
-            break
+def build_parser():
+    parser = argparse.ArgumentParser(description="CFD target-task training; not a Table 4 reproduction or automatic ROM transfer.")
+    parser.add_argument("--target", nargs=2, type=float, required=True, metavar=("X", "Y"))
+    parser.add_argument("--initializer", required=True, metavar="MODULE:FUNCTION",
+        help="Complete case/UDF setup and reset callback (solver, work_dir) returning the real initial 7D state.")
+    parser.add_argument("--workers", type=positive_int, default=1)
+    parser.add_argument("--timesteps", type=positive_int, default=20_000)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--output-dir", type=Path, default=Path("."))
+    return parser
 
 
-def main() -> None:
-    """Launch multi-worker PPO training with checkpoint resumption."""
-    # Set multiprocessing start method
-    if os.name == "nt":
-        mp.set_start_method("spawn", force=True)
-    else:
-        mp.set_start_method("fork", force=True)
-
-    # Training hyper-parameters
-    num_workers = 1
-    total_timesteps = 20_000
-    use_lstm = False
-
-    print("=" * 60)
-    print("FISH ESCAPE TRAINING (stable + checkpoint resumption)")
-    print("=" * 60)
-    print(f"  Workers            : {num_workers}")
-    print(f"  Timesteps / worker : {total_timesteps}")
-    print(f"  LSTM policy        : {use_lstm}")
-    print(f"  Task               : Navigate fish to target while escaping")
-    print(f"  Startup strategy   : Staggered (30 s between workers)")
-    print("=" * 60)
-
-    manager = SharedTrainingManager(num_workers)
-
-    # Start monitor process
-    monitor_process = mp.Process(
-        target=monitor_workers, args=(manager, num_workers)
-    )
-    monitor_process.start()
-
-    # Start training processes
-    processes: List[mp.Process] = []
-    for rank in range(num_workers):
-        p = mp.Process(
-            target=train_with_rank,
-            args=(rank, num_workers, manager, total_timesteps, use_lstm),
-        )
-        p.start()
-        processes.append(p)
-        print(f"Worker {rank} process launched")
-
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not all(math.isfinite(value) for value in args.target):
+        parser.error("--target must contain two finite coordinates.")
+    # Reject missing setup before any worker/solver is launched.
     try:
-        for p in processes:
-            p.join()
-        monitor_process.terminate()
-        monitor_process.join()
+        resolve_initializer(args.initializer)
+    except (ValueError, OSError, ImportError, AttributeError) as error:
+        parser.error(str(error))
+    # Dependencies are also checked in the parent process, without creating Fluent.
+    import torch  # noqa: F401
+    from stable_baselines3 import PPO  # noqa: F401
+    from CFD_stage.EnvFluent import FluentEnv  # noqa: F401
 
+    mp.set_start_method("spawn", force=True)
+    settings = {"output_dir": str(args.output_dir.resolve()), "target": args.target,
+                "initializer": args.initializer, "timesteps": args.timesteps,
+                "seed": args.seed}
+    manager = SharedTrainingManager(args.workers)
+    processes = []
+    try:
+        for rank in range(args.workers):
+            process = mp.Process(target=train_with_rank, args=(rank, manager, settings))
+            process.start()
+            processes.append(process)
+        for process in processes:
+            process.join()
     except KeyboardInterrupt:
-        print("\nInterrupted! Terminating processes...")
-        for p in processes:
-            p.terminate()
-        monitor_process.terminate()
-        for p in processes:
-            p.join()
-        monitor_process.join()
-
-    # Report best model
-    best_model_path = manager.get_best_model_path()
-    best_reward = manager.get_best_reward()
-    print(
-        f"\nTraining completed.  Best model: {best_model_path} "
-        f"(reward: {best_reward:.2f})"
-    )
-
-    # Copy best model to a well-known location
-    if best_model_path and os.path.exists(best_model_path):
-        final_best_path = "./saved_models/best_obstacle_avoidance_model.zip"
-        try:
-            shutil.copy(best_model_path, final_best_path)
-            print(f"Best model copied to {final_best_path}")
-        except Exception as e:
-            print(f"Failed to copy best model: {e}")
-    else:
-        print("No valid best model found.")
+        for process in processes:
+            process.terminate()
+        for process in processes:
+            process.join()
+        raise
+    failed = any(process.exitcode != 0 for process in processes) or any(
+        value != SharedTrainingManager.STATUS_DONE for value in manager.worker_status)
+    print(f"Best CFD training checkpoint: {manager.get_best_model_path() or 'none'}")
+    if failed:
+        raise SystemExit("One or more CFD workers failed; see worker logs.")
 
 
 if __name__ == "__main__":

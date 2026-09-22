@@ -1,323 +1,268 @@
-"""Gymnasium environment wrapping ANSYS Fluent for fish locomotion control.
+"""Explicit target-navigation wrapper for the supplied Fluent UDF.
 
-This module defines :class:`FluentEnv`, a Gymnasium-compatible reinforcement
-learning environment that interfaces with ANSYS Fluent to simulate a
-self-propelled fish in a 2-D flow domain.  The agent controls the fish's
-undulation frequency and amplitude while a predator pursues it.
+The archived CFD reward is a target reward, not a reconstructed escape task.
+Only ``interface_profile='legacy'`` is supported here. The manuscript escape
+interface requires a separately validated CFD task, action mapping and reset
+procedure. See ``fluent_backend.py`` for the real case initialization contract.
 """
 
 from __future__ import annotations
 
 import csv
-import os
-import random
-from typing import Any, Dict, Optional, Tuple
+from pathlib import Path
+from typing import Any, Callable
 
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
-import ansys.fluent.core as pyfluent
+try:
+    from .fluent_backend import FluentBackend
+    from .interface import action_bounds, decode_action, observation
+except ImportError:  # Historical direct script import.
+    from fluent_backend import FluentBackend
+    from interface import action_bounds, decode_action, observation
 
 
 class FluentEnv(gym.Env):
-    """Gymnasium environment for fish escape control via ANSYS Fluent CFD.
+    """Legacy CFD target task with explicit physical configuration.
 
-    The fish is modelled as a self-propelled body whose kinematics are
-    parameterised by undulation frequency and amplitude.  A point-mass
-    predator chases the fish at a constant speed; the episode terminates
-    upon capture, collision with an obstacle, domain exit, or timeout.
+    ``target_position`` and ``initializer(solver, work_dir)`` are required.
+    The initializer must fully reset real flow and UDF globals, then return the
+    actual initial ``[x,y,yaw,vx_world,vy_world,wz,time]`` state. The archive does
+    not supply this initialization journal. Injecting a solver supports tests
+    and pre-existing sessions; it does not remove the initialization requirement.
+
+    Legacy actions are ``[frequency_hz, amplitude]``; each lasts up to one period
+    or the remaining CFD-step budget. The diagnostic predator does not determine
+    this target task's reward, success or termination. Escape is unsupported.
     """
+
+    metadata = {"render_modes": []}
 
     def __init__(
         self,
         max_steps: int = 2000,
-        reward_function: str = "escape",
+        reward_function: str = "target",
         simu_name: str = "CFD_0",
         predator_speed: float = 0.3,
         capture_radius: float = 0.1,
+        *,
+        target_position=None,
+        obstacle_position=None,
+        obstacle_diameter: float = 0.0,
+        interface_profile: str = "legacy",
+        time_step: float = 0.01,
+        work_dir=None,
+        solver=None,
+        initializer: Callable | None = None,
+        launch_kwargs: dict | None = None,
     ) -> None:
         super().__init__()
-        print(f"--- Initializing FluentEnv: {simu_name} ---")
-
-        # General parameters
-        self.simu_name = simu_name
-        self.max_steps = max_steps
+        if interface_profile != "legacy" or reward_function != "target":
+            raise NotImplementedError(
+                "CFD supports only interface_profile='legacy', reward_function='target'. "
+                "The manuscript_escape CFD task has not been recovered or validated."
+            )
+        if target_position is None:
+            raise ValueError("target_position must be explicitly supplied; no target is inferred.")
+        if not isinstance(max_steps, (int, np.integer)) or isinstance(max_steps, bool) or max_steps <= 0:
+            raise ValueError("max_steps must be a positive integer.")
+        if not np.isfinite(time_step) or time_step <= 0:
+            raise ValueError("time_step must be finite and positive.")
+        if not np.isfinite(predator_speed) or predator_speed < 0:
+            raise ValueError("predator_speed must be finite and nonnegative.")
+        if not np.isfinite(capture_radius) or capture_radius <= 0:
+            raise ValueError("capture_radius must be finite and positive (diagnostic only).")
+        if Path(simu_name).name != simu_name or simu_name in {"", ".", ".."}:
+            raise ValueError("simu_name must be a single directory name.")
+        self.interface_profile = interface_profile
         self.reward_function = reward_function
-        self.log_file = f"log_{simu_name}.csv"
-        self.device: Optional[str] = None
-        self.action_summary_file = "action_summary.txt"
+        self.simu_name = simu_name
+        self.max_steps = int(max_steps)
+        self.time_step = float(time_step)
+        self.predator_speed = float(predator_speed)
+        self.capture_radius = float(capture_radius)
+        self.flow_domain_x_min, self.flow_domain_x_max = -4.0, 12.0
+        self.flow_domain_y_min, self.flow_domain_y_max = -2.0, 2.0
+        self.target_position = self._position(target_position, "target_position")
+        if self._outside_domain(self.target_position):
+            raise ValueError("target_position must lie inside the configured [-4,12] x [-2,2] domain.")
+        self.obstacle_position = (
+            None if obstacle_position is None else self._position(obstacle_position, "obstacle_position")
+        )
+        if not np.isfinite(obstacle_diameter) or obstacle_diameter < 0:
+            raise ValueError("obstacle_diameter must be finite and nonnegative.")
+        if self.obstacle_position is not None and obstacle_diameter <= 0:
+            raise ValueError("A configured obstacle requires a positive obstacle_diameter.")
+        if self.obstacle_position is None and obstacle_diameter != 0:
+            raise ValueError("obstacle_position is required when obstacle_diameter is nonzero.")
+        self.obstacle_diameter = float(obstacle_diameter)
 
-        # Environment constants
-        self.predator_speed = predator_speed
-        self.capture_radius = capture_radius
-        self.flow_domain_x_min: float = -4.0
-        self.flow_domain_x_max: float = 12.0
-        self.flow_domain_y_min: float = -2.0
-        self.flow_domain_y_max: float = 2.0
-
-        # Discretised physics / action parameters
-        self.period_options = [2]  # available undulation period options
-        self.turning_options = [
-            -0.1, 0.08, -0.06, -0.04, -0.02,
-            0, 0.02, 0.04, 0.06, 0.08, 0.1,
-        ]  # curvature coefficient options
-        self.delta_options = [-1, 0, 1]  # [at_delta, tc_delta]
-
-        # Predator state
-        self.predator_pos = np.zeros(2, dtype=np.float32)
-        self._generate_predator_position()
-
-        # Observation: [x, y, theta, vx, vy, wz, time]
+        low, high = action_bounds()
+        self.action_space = spaces.Box(np.asarray(low, dtype=np.float32),
+                                       np.asarray(high, dtype=np.float32), dtype=np.float32)
+        # Terminal states may lie outside the domain; the UDF yaw is unwrapped.
         self.observation_space = spaces.Box(
-            low=np.array([
-                self.flow_domain_x_min, self.flow_domain_y_min,
-                -np.pi, -np.inf, -np.inf, -np.inf, 0.0,
-            ]),
-            high=np.array([
-                self.flow_domain_x_max, self.flow_domain_y_max,
-                np.pi, np.inf, np.inf, np.inf, np.inf,
-            ]),
-            dtype=np.float64,
+            low=np.array([-np.inf] * 6 + [0.0], dtype=np.float64),
+            high=np.full(7, np.inf, dtype=np.float64), dtype=np.float64,
         )
-        # Action: [frequency, amplitude] -> mapped to [period, curvature]
-        self.action_space = spaces.Box(
-            low=np.array([0.0, 0.0]),
-            high=np.array([2.0, np.pi / 4]),
-            dtype=np.float32,
-        )
-
-        # Episode state variables
-        self.episode_number: int = 0
-        self.current_step: int = 0
-        self.simulation_time: float = 0.0
-        self.time_step: float = 0.01  # Fluent simulation time-step (s)
-        self.fish_position = np.array([0.0, 0.0])
-        self.fish_orientation: float = 0.0
-        self.state = np.zeros(6, dtype=np.float64)
-
-        # Working directory
-        self.env_dir = os.path.join("fishmove", f"{self.simu_name}")
-        os.makedirs(self.env_dir, exist_ok=True)
-        os.chdir(self.env_dir)
-
-        # Fluent console transcript
-        self.console_log = "fluent_console.log"
-        self._transcript_active = False
-
-        # Launch Fluent solver
-        self.solver = pyfluent.launch_fluent(
-            precision="double",
-            processor_count=6,
-            dimension=2,
-            ui_mode="gui",  # gui | no_gui_or_graphics | no_gui
-        )
-        self.start_class(complete_reset=True)
-        print(f"--- FluentEnv {self.simu_name} initialized ---")
-
-    # Internal helpers
-
-    def _generate_predator_position(self) -> None:
-        """Randomly place the predator 0.5–1.0 m from the fish."""
-        r = random.uniform(0.5, 1.0)
-        ang = random.uniform(1.5 * np.pi, 2 * np.pi)
-        self.predator_pos = self.fish_position + r * np.array(
-            [np.cos(ang), np.sin(ang)], dtype=np.float32,
-        )
-
-    # Gymnasium API
-
-    def reset(
-        self,
-        seed: Optional[int] = None,
-        options: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[np.ndarray, Dict[str, Any]]:
-        """Reset the environment to an initial state."""
-        if seed is not None:
-            np.random.seed(seed)
-
-        self.initialize_flow(complete_reset=True)
+        self.env_dir = Path(work_dir or Path.cwd() / "runs" / simu_name).resolve()
+        self.backend = FluentBackend(self.env_dir, solver=solver,
+                                     initializer=initializer, launch_kwargs=launch_kwargs)
+        self.log_file = self.env_dir / "environment_steps.csv"
+        self.console_log = self.env_dir / "fluent_console.log"
+        self.render_mode = None
+        self.episode_number = 0
         self.current_step = 0
-        self.episode_number += 1
         self.simulation_time = 0.0
-        self.fish_position = np.array([0.0, 0.0])
+        self.fish_position = np.zeros(2, dtype=np.float64)
         self.fish_orientation = 0.0
-        self.state = np.zeros(6, dtype=np.float64)
+        self.predator_pos = np.zeros(2, dtype=np.float64)
+        self.state = np.zeros(7, dtype=np.float64)
+        self.current_period_value = 0.0
+        self.current_turning_value = 0.0
+        self._needs_reset = True
+        self._closed = False
+
+    @property
+    def solver(self):
+        return self.backend.solver
+
+    @staticmethod
+    def _position(value, name):
+        result = np.asarray(value, dtype=np.float64)
+        if result.shape != (2,) or not np.isfinite(result).all():
+            raise ValueError(f"{name} must contain two finite coordinates.")
+        return result.copy()
+
+    def _outside_domain(self, position):
+        x, y = position
+        return (x < self.flow_domain_x_min or x > self.flow_domain_x_max or
+                y < self.flow_domain_y_min or y > self.flow_domain_y_max)
+
+    def _generate_predator_position(self):
+        radius = self.np_random.uniform(0.5, 1.0)
+        angle = self.np_random.uniform(1.5 * np.pi, 2.0 * np.pi)
+        self.predator_pos = self.fish_position + radius * np.array([np.cos(angle), np.sin(angle)])
+
+    def _calculate_obstacle_distance(self):
+        if self.obstacle_position is None:
+            return float("inf")
+        return float(np.linalg.norm(self.fish_position - self.obstacle_position))
+
+    def _get_obs(self):
+        return np.asarray(observation(self.state), dtype=np.float64)
+
+    def _set_state(self, state):
+        self.state = np.asarray(state, dtype=np.float64).copy()
+        self.fish_position = self.state[:2].copy()
+        self.fish_orientation = float(self.state[2])
+        self.simulation_time = float(self.state[6])
+
+    def reset(self, *, seed=None, options=None):
+        if self._closed:
+            raise RuntimeError("Cannot reset a closed FluentEnv.")
+        super().reset(seed=seed)
+        self._needs_reset = True
+        initial_state = self.backend.reset()
+        self._set_state(initial_state)
+        if self._outside_domain(self.fish_position):
+            raise ValueError("The initialized fish position is outside the CFD domain.")
+        self.current_step = 0
+        self.current_period_value = 0.0
+        self.current_turning_value = 0.0
+        self.episode_number += 1
         self._generate_predator_position()
-        self.prev_target_distance = np.linalg.norm(
-            self.fish_position - self.target_position
-        )
-        return self.state, {}
+        self._needs_reset = False
+        return self._get_obs(), {"task": "target", "interface_profile": self.interface_profile,
+                                 "predator_position": self.predator_pos.copy()}
 
-    def step(
-        self, action: np.ndarray
-    ) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
-        """Execute one control action and advance the Fluent simulation.
-
-        *action* is a two-element array ``[frequency, amplitude]``.
-        """
-        # 1) Decode control action [frequency, amplitude]
-        frequency = float(action[0])
-        amplitude = float(action[1])
-
-        # 2) Map to period and curvature coefficient
-        period = 1.0 / frequency
-        a_s = (amplitude / (np.pi / 4)) * 1.4
-        curvature = a_s * 0.1  # mapped to [-0.1, 0.1] range
-
-        # 3) Update control parameters
+    def step(self, action):
+        if self._closed or self._needs_reset:
+            raise RuntimeError("Call reset() before stepping, including after an episode ends.")
+        amplitude, frequency_hz = decode_action(action)
+        if not np.isfinite(frequency_hz) or frequency_hz <= 0:
+            raise ValueError("CFD frequency must be strictly positive.")
+        period = 1.0 / frequency_hz
+        if not np.isfinite(period):
+            raise ValueError("CFD frequency is too small to represent a finite period.")
         self.current_period_value = period
-        self.current_turning_value = curvature
-        steps_to_execute = int(self.current_period_value / self.time_step)
-
-        # 4) Status flags
-        failed = False
-        success = False
+        # Preserve the archive: at is [0,0.14], scaling the UDF's turning term.
+        # Its separate A_w oscillatory amplitude remains fixed in the C source.
+        self.current_turning_value = (amplitude / (np.pi / 4)) * 0.14
+        remaining = self.max_steps - self.current_step
+        steps_to_execute = (remaining if period >= remaining * self.time_step
+                            else max(1, int(period / self.time_step)))
+        failed = success = terminated = False
         failure_reason = ""
-        terminated = False
-        truncated = False
-        step_i = -1
-
-        # 5) Synchronise parameters with Fluent
-        self.solver.execute_tui(f"/solve/set/time-step {self.time_step}")
-        self.solver.execute_tui(f"(rpsetvar 'tc {self.current_period_value})")
-        self.solver.execute_tui(f"(rpsetvar 'at {self.current_turning_value})")
-
-        # 6) Advance simulation in Fluent
-        for step_i in range(steps_to_execute):
-            if step_i == 0:
-                self.solver.execute_tui(
-                    '/define/user-defined/execute-on-demand '
-                    '"add_action_from_console::libudf"'
-                )
-
-            if self.current_step >= self.max_steps:
-                truncated = True
-                break
-
-            try:
-                self.simulation_time += self.time_step
+        error_message = ""
+        executed = 0
+        obstacle_distance = self._calculate_obstacle_distance()
+        try:
+            self.backend.set_action(period, self.current_turning_value, self.time_step)
+            for _ in range(steps_to_execute):
+                self._set_state(self.backend.advance(self.time_step))
                 self.current_step += 1
-                self.solver.execute_tui("/solve/dual-time-iterate 1 10")
-
-                # Update fish pose
-                xdisp, ydisp, thetadisp, _, _, _ = self._read_output_file()
-                self.fish_position[0] = xdisp
-                self.fish_position[1] = ydisp
-                self.fish_orientation = thetadisp
-
-                # Predator pursuit behaviour
-                vec_pf = self.fish_position - self.predator_pos
-                dist_pf = float(np.linalg.norm(vec_pf))
-                if dist_pf > 1e-8:
-                    self.predator_pos += (
-                        (vec_pf / dist_pf) * self.predator_speed * self.time_step
-                    )
-                else:
-                    jitter = (np.random.rand(2) - 0.5) * 1e-3
-                    self.predator_pos += jitter.astype(np.float32)
-
-                # Collision / out-of-domain checks
+                executed += 1
+                toward_fish = self.fish_position - self.predator_pos
+                distance = float(np.linalg.norm(toward_fish))
+                if distance > 0:
+                    self.predator_pos += toward_fish / distance * min(distance, self.predator_speed * self.time_step)
                 obstacle_distance = self._calculate_obstacle_distance()
-                if obstacle_distance < (self.obstacle_diameter / 2 + 0.02):
-                    failed = True
-                    failure_reason = "collision_with_obstacle"
-                    terminated = True
+                if obstacle_distance < self.obstacle_diameter / 2 + 0.02:
+                    failed, terminated, failure_reason = True, True, "collision_with_obstacle"
                     break
-
-                if (
-                    self.fish_position[0] > self.flow_domain_x_max
-                    or self.fish_position[0] < self.flow_domain_x_min
-                    or self.fish_position[1] > self.flow_domain_y_max
-                    or self.fish_position[1] < self.flow_domain_y_min
-                ):
-                    failed = True
-                    failure_reason = "out_of_flow_domain"
-                    terminated = True
+                if self._outside_domain(self.fish_position):
+                    failed, terminated, failure_reason = True, True, "out_of_flow_domain"
                     break
+                if np.linalg.norm(self.fish_position - self.target_position) < 0.2:
+                    success = terminated = True
+                    break
+        except Exception as exc:
+            failed, terminated, failure_reason = True, True, "fluent_exception"
+            error_message = f"{type(exc).__name__}: {exc}"
 
-            except Exception as e:
-                print(
-                    f"[{self.simu_name}] Error in simulation step {step_i}: {e}"
-                )
-                failed = True
-                failure_reason = "fluent_exception"
-                terminated = True
-                break
-
-        # Compute reward
-        self.state = self._get_obs()
-        target_distance = np.linalg.norm(
-            self.fish_position - self.target_position
-        )
-        success = target_distance < 0.2
+        truncated = not terminated and self.current_step >= self.max_steps
+        self._needs_reset = terminated or truncated
+        target_distance = float(np.linalg.norm(self.fish_position - self.target_position))
+        reward = -10.0 * target_distance
         if success:
-            terminated = True
-
-        reward = -target_distance * 10.0  # distance-based penalty
-        success_reward = 1000 if success else 0
-
+            reward += 1000.0
         if failed:
-            if failure_reason == "collision_with_obstacle":
-                reward -= 500
-            elif failure_reason == "out_of_flow_domain":
-                reward -= 400
-            elif failure_reason == "fluent_exception":
-                reward -= 1000
-
-        info: Dict[str, Any] = {
-            "simulation_time": self.simulation_time,
-            "turning_action": self.current_turning_value,
-            "period_action": self.current_period_value,
-            "fish_position": self.fish_position.copy(),
-            "fish_orientation": self.fish_orientation,
-            "obstacle_distance": obstacle_distance,
-            "target_distance": target_distance,
-            "success": success,
-            "failed": failed,
-            "failure_reason": failure_reason,
-            "timeout": truncated,
-            "steps_executed": (step_i + 1) if step_i >= 0 else 0,
+            reward -= {"collision_with_obstacle": 500.0, "out_of_flow_domain": 400.0,
+                       "fluent_exception": 1000.0}[failure_reason]
+        info: dict[str, Any] = {
+            "task": "target", "interface_profile": self.interface_profile,
+            "simulation_time": self.simulation_time, "turning_action": self.current_turning_value,
+            "period_action": period, "fish_position": self.fish_position.copy(),
+            "fish_orientation": self.fish_orientation, "obstacle_distance": obstacle_distance,
+            "target_distance": target_distance, "success": success, "failed": failed,
+            "failure_reason": failure_reason, "timeout": truncated, "steps_executed": executed,
+            "error": error_message,
         }
+        try:
+            self._log_variables(info, reward)
+        except OSError as exc:
+            info["logging_error"] = f"{type(exc).__name__}: {exc}"
+        return self._get_obs(), float(reward), terminated, truncated, info
 
-        return self.state.copy(), reward + success_reward, terminated, truncated, info
+    def _log_variables(self, info, reward):
+        self.env_dir.mkdir(parents=True, exist_ok=True)
+        header_needed = not self.log_file.exists() or self.log_file.stat().st_size == 0
+        with self.log_file.open("a", encoding="utf-8", newline="") as stream:
+            writer = csv.writer(stream)
+            if header_needed:
+                writer.writerow(["episode", "cfd_steps", "time", "x", "y", "yaw", "vx_world",
+                                 "vy_world", "wz", "period", "turning", "target_distance",
+                                 "obstacle_distance", "raw_reward", "success", "failed", "timeout", "error"])
+            writer.writerow([self.episode_number, self.current_step, self.simulation_time,
+                             *self.state[:6], self.current_period_value, self.current_turning_value,
+                             info["target_distance"], info["obstacle_distance"], reward,
+                             info["success"], info["failed"], info["timeout"], info["error"]])
 
-    def close(self) -> None:
-        """Shut down the Fluent solver and clean up resources."""
-        if hasattr(self, "solver") and self.solver is not None:
-            try:
-                self._stop_transcript_safe()
-                self.solver.exit()
-            except Exception as e:
-                print(f"[{self.simu_name}] Error closing Fluent: {e}")
-
-    # Logging
-
-    def _log_variables(self) -> None:
-        """Append the current simulation state to the variable record CSV."""
-        filename = "variable_record.txt"
-        mode = "a" if os.path.exists(filename) else "w"
-        with open(filename, mode, encoding="utf-8") as f:
-            writer = csv.writer(f, delimiter=",", lineterminator="\n")
-            if mode == "w":
-                header = [
-                    "simulation_time",
-                    "x_disp",
-                    "y_disp",
-                    "theta_disp",
-                    "turning_action",
-                    "period_action",
-                    "obstacle_distance",
-                    "target_distance",
-                ]
-                writer.writerow(header)
-            writer.writerow([
-                self.simulation_time,
-                self.fish_position[0],
-                self.fish_position[1],
-                self.fish_orientation,
-                self.current_turning_value,
-                self.current_period_value,
-                self._calculate_obstacle_distance(),
-                np.linalg.norm(self.fish_position - self.target_position),
-            ])
+    def close(self):
+        if not self._closed:
+            self._closed = True
+            self._needs_reset = True
+            self.backend.close()
