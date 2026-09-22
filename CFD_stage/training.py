@@ -1,4 +1,4 @@
-"""Multi-worker PPO training with explicit Fluent setup.
+"""Multi-worker PPO training loop with checkpoint resumption.
 
 This script orchestrates distributed reinforcement-learning training for
 the explicitly configured CFD target task.  Each worker launches its own ANSYS Fluent instance,
@@ -13,6 +13,7 @@ import csv
 import importlib
 import math
 from pathlib import Path
+import shutil
 import sys
 import os
 import time
@@ -26,6 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from CFD_stage.interface import interface_contract
+from CFD_stage.checkpoints import save_bundle, validate_bundle, validate_spaces
 
 
 def positive_int(value):
@@ -53,10 +55,39 @@ def cfd_contract(target, initializer):
             "target_position": list(target), "initializer": initializer}
 
 
+def select_resume_bundle(save_path, output_dir, expected):
+    """Validate a candidate; callers with active writers must hold their lock."""
+    for directory in (Path(save_path), Path(output_dir) / "saved_models"):
+        model = directory / "saved_model.zip"
+        if model.exists():
+            stats = directory / "saved_vecnormalize.pkl"
+            metadata = model.with_suffix(".metadata.json")
+            validate_bundle(model, stats, metadata, expected)
+            return model, stats
+    return None
 
 
+def snapshot_resume_bundle(save_path, output_dir, expected, manager):
+    """Copy a consistent bundle under the writer lock into this worker's area.
 
-
+    The returned files are private to the worker, so subsequent VecNormalize
+    and PPO loads cannot race with a new global best. No solver setup or model
+    deserialization is performed while holding the shared lock.
+    """
+    with manager.lock:
+        bundle = select_resume_bundle(save_path, output_dir, expected)
+        if bundle is None:
+            return None
+        model, stats = bundle
+        metadata = model.with_suffix(".metadata.json")
+        destination = Path(save_path) / "resume_snapshot"
+        destination.mkdir(parents=True, exist_ok=True)
+        # Preserve basenames because the metadata names its companion files.
+        for source in (model, stats, metadata):
+            shutil.copy2(source, destination / source.name)
+        local_model, local_stats = destination / model.name, destination / stats.name
+        validate_bundle(local_model, local_stats, destination / metadata.name, expected)
+    return local_model, local_stats
 
 
 class SharedTrainingManager:
@@ -126,9 +157,15 @@ class CallbackLogic:
         save_path: str,
         rank: int,
         manager: SharedTrainingManager,
+        contract: dict,
+        seed: int,
+        run_config: dict,
         verbose: int = 1,
     ) -> None:
         super().__init__(verbose)
+        self.contract = contract
+        self.seed = seed
+        self.run_config = run_config
         self.should_stop = False
         self.save_path = save_path
         self.rank = rank
@@ -159,7 +196,7 @@ class CallbackLogic:
         # Initialise CSV log headers
         with open(self.reward_log_path, "w", newline="") as f:
             csv.writer(f).writerow([
-                "Episode", "Reward", "Mean_Reward", "Best_Global_Reward",
+                "Episode", "Raw_Reward", "Mean_Raw_Reward", "Best_Global_Raw_Reward",
                 "Success", "Failure_Reason", "Episode_Length",
             ])
 
@@ -193,12 +230,15 @@ class CallbackLogic:
         )
         Path(self.save_path).parent.mkdir(parents=True, exist_ok=True)
 
-    def _save_checkpoint(self, model_path, vecnorm_path):
-        """Save the model and its current normalization statistics."""
-        self.model.save(model_path)
+    def _save_checkpoint(
+        self, model_path: str, vecnorm_path: str
+    ) -> None:
+        """Save the model and ``VecNormalize`` statistics to disk."""
         vecnorm = self.model.get_vec_normalize_env()
-        if vecnorm is not None:
-            vecnorm.save(vecnorm_path)
+        if vecnorm is None:
+            raise RuntimeError("Cannot save a resumable model without VecNormalize.")
+        save_bundle(self.model, vecnorm, model_path, vecnorm_path,
+                    self.contract, self.seed, self.run_config)
 
     def _on_training_end(self):
         if self.episode_file is not None:
@@ -268,7 +308,6 @@ class CallbackLogic:
                 "failure_reason": info.get("failure_reason", ""),
             })
 
-            self.current_episode_reward += float(reward)
             if done:
                 self._handle_episode_end(info)
                 if self.should_stop:
@@ -284,6 +323,16 @@ class CallbackLogic:
 
     def _handle_episode_end(self, info: Dict[str, Any]) -> None:
         """Process logging, checkpointing, and failure tracking."""
+        # Monitor wraps the raw environment inside VecNormalize. Its terminal
+        # episode return is therefore comparable across workers whose reward
+        # normalization statistics may differ. Never rank models by locals'
+        # normalized PPO rewards or silently fall back to their sum.
+        episode = info.get("episode")
+        if not isinstance(episode, dict) or "r" not in episode:
+            raise ValueError("Monitor episode['r'] is required for raw-reward checkpoint comparison.")
+        self.current_episode_reward = float(episode["r"])
+        if not math.isfinite(self.current_episode_reward):
+            raise ValueError("Monitor episode reward must be finite.")
         self.episode_count += 1
         self.episode_rewards.append(self.current_episode_reward)
 
@@ -344,9 +393,14 @@ class CallbackLogic:
             if is_global_best:
                 best_status = "GLOBAL BEST!"
                 try:
-                    self._save_checkpoint(
-                        self.global_saved_model, self.global_saved_vecnorm
-                    )
+                    # Serialize the three-file global bundle across workers.
+                    # A newer best may have replaced this candidate meanwhile.
+                    with self.manager.lock:
+                        current_best = self.manager.best_model_path.value.decode("utf-8").rstrip("\x00")
+                        if current_best == model_path:
+                            self._save_checkpoint(
+                                self.global_saved_model, self.global_saved_vecnorm
+                            )
                 except Exception as e:
                     print(
                         f"[Rank {self.rank}] Warning: "
@@ -394,8 +448,8 @@ class CallbackLogic:
 
         print(
             f"[Rank {self.rank:02d}|Ep {self.episode_count:03d}] "
-            f"Reward: {self.current_episode_reward:.2f} | "
-            f"Mean10: {mean_reward:.2f} | "
+            f"Raw Reward: {self.current_episode_reward:.2f} | "
+            f"Raw Mean10: {mean_reward:.2f} | "
             f"Success Rate: {success_rate:.2%} | "
             f"Target Dist: {info.get('target_distance', float('inf')):.2f} | "
             f"Global Best: {global_best:.2f} {best_status}"
@@ -420,7 +474,7 @@ def create_callback(*args, **kwargs):
     return EnhancedCallback(*args, **kwargs)
 
 
-def build_env(rank, log_path, env_kwargs):
+def build_env_with_optional_resume(rank, log_path, env_kwargs, stats_path=None):
     from stable_baselines3.common.monitor import Monitor
     from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
     from CFD_stage.EnvFluent import FluentEnv
@@ -429,11 +483,23 @@ def build_env(rank, log_path, env_kwargs):
         return Monitor(FluentEnv(max_steps=800, simu_name=f"CFD_{rank}", **env_kwargs),
                        str(Path(log_path) / "monitor"))
 
-    return VecNormalize(DummyVecEnv([make_env]), norm_obs=True, norm_reward=True, clip_obs=10.0)
+    base = DummyVecEnv([make_env])
+    try:
+        if stats_path is not None:
+            env = VecNormalize.load(str(stats_path), base)
+            if not env.norm_obs:
+                raise ValueError("CFD resume requires training observation-normalization statistics.")
+            env.training = True
+            env.norm_reward = True
+            return env
+        return VecNormalize(base, norm_obs=True, norm_reward=True, clip_obs=10.0)
+    except Exception:
+        base.close()
+        raise
 
 
 def train_with_rank(rank, manager, settings):
-    """Train the explicitly configured CFD target task."""
+    """Train a target-task CFD policy; automatic ROM transfer is unsupported."""
     import torch
     from stable_baselines3 import PPO
 
@@ -442,28 +508,42 @@ def train_with_rank(rank, manager, settings):
     save_path = output_dir / "saved_models" / f"worker_{rank}"
     log_path = output_dir / "logs" / f"worker_{rank}"
     seed = settings["seed"] + rank * 42
+    contract = cfd_contract(settings["target"], settings["initializer"])
+    run_config = {"max_steps": 800, "target_position": settings["target"],
+                  "initializer": settings["initializer"],
+                  "total_timesteps_requested": settings["timesteps"]}
     try:
         manager.update_worker_status(rank, SharedTrainingManager.STATUS_RUNNING)
         time.sleep(rank * 30)
         for folder in (save_path, log_path):
             folder.mkdir(parents=True, exist_ok=True)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        bundle = snapshot_resume_bundle(save_path, output_dir, contract, manager) if settings["resume"] else None
         initializer = resolve_initializer(settings["initializer"])
-        env = build_env(rank, log_path,
+        env = build_env_with_optional_resume(rank, log_path,
             {"target_position": tuple(settings["target"]), "reward_function": "target",
-             "initializer": initializer, "work_dir": output_dir / "runs" / f"CFD_{rank}"})
+             "interface_profile": "legacy", "initializer": initializer,
+             "work_dir": output_dir / "runs" / f"CFD_{rank}"},
+            stats_path=bundle[1] if bundle else None)
         env.seed(seed)
-        model = PPO("MlpPolicy", env,
-            policy_kwargs=dict(net_arch=dict(pi=[1024, 512, 256], vf=[512, 256, 128]),
-                               activation_fn=torch.nn.ReLU),
-            learning_rate=3e-4, n_steps=32, batch_size=16, n_epochs=10,
-            gamma=0.995, gae_lambda=0.98, clip_range=0.2, ent_coef=0.005,
-            vf_coef=0.5, max_grad_norm=0.5, verbose=0,
-            tensorboard_log=str(log_path),
-            device=torch.device("cuda" if torch.cuda.is_available() else "cpu"), seed=seed)
-        callback = create_callback(str(save_path), rank, manager)
-        model.learn(total_timesteps=settings["timesteps"], callback=callback)
-        model.save(str(save_path / "final_model.zip"))
-        env.save(str(save_path / "final_model.vecnormalize.pkl"))
+        if bundle:
+            model = PPO.load(str(bundle[0]), device=device)
+            validate_spaces(model, env)
+            model.set_env(env)
+            model.set_random_seed(seed)
+        else:
+            model = PPO("MlpPolicy", env,
+                policy_kwargs=dict(net_arch=dict(pi=[1024, 512, 256], vf=[512, 256, 128]),
+                                   activation_fn=torch.nn.ReLU),
+                learning_rate=3e-4, n_steps=32, batch_size=16, n_epochs=10,
+                gamma=0.995, gae_lambda=0.98, clip_range=0.2, ent_coef=0.005,
+                vf_coef=0.5, max_grad_norm=0.5, verbose=0,
+                tensorboard_log=str(log_path), device=device, seed=seed)
+        callback = create_callback(str(save_path), rank, manager, contract, seed, run_config)
+        model.learn(total_timesteps=settings["timesteps"], callback=callback,
+                    reset_num_timesteps=bundle is None)
+        save_bundle(model, env, save_path / "final_model.zip", save_path / "final_model.vecnormalize.pkl",
+                    contract, seed, run_config)
         if callback.should_stop:
             manager.update_worker_status(rank, SharedTrainingManager.STATUS_ERROR)
             print(f"Worker {rank}: stopped after repeated solver failures.")
@@ -472,8 +552,8 @@ def train_with_rank(rank, manager, settings):
             print(f"Worker {rank}: training completed.")
     except KeyboardInterrupt:
         if model is not None and env is not None:
-            model.save(str(save_path / "interrupted_model.zip"))
-            env.save(str(save_path / "interrupted_model.vecnormalize.pkl"))
+            save_bundle(model, env, save_path / "interrupted_model.zip",
+                        save_path / "interrupted_model.vecnormalize.pkl", contract, seed, run_config)
         manager.update_worker_status(rank, SharedTrainingManager.STATUS_ERROR)
     except Exception as error:
         print(f"Worker {rank}: {error}")
@@ -495,17 +575,26 @@ def build_parser():
     parser.add_argument("--timesteps", type=positive_int, default=20_000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output-dir", type=Path, default=Path("."))
+    parser.add_argument("--no-resume", action="store_true", help="Start a new CFD policy instead of loading a compatible CFD bundle.")
+    parser.add_argument("--rom-checkpoint", type=Path, help="Unsupported: supplied only to produce an explicit diagnostic.")
+    parser.add_argument("--rom-stats", type=Path, help="Unsupported: automatic cross-stage transfer is not implemented.")
     return parser
 
 
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.rom_checkpoint is not None or args.rom_stats is not None:
+        parser.error("Automatic ROM-to-CFD PPO checkpoint transfer is not implemented: action units/order/bounds and observation meaning differ. Do not copy a ROM model into CFD resume paths.")
     if not all(math.isfinite(value) for value in args.target):
         parser.error("--target must contain two finite coordinates.")
-    # Reject missing setup before any worker/solver is launched.
+    # Reject missing setup and incompatible bundles before any worker/solver is launched.
     try:
         resolve_initializer(args.initializer)
+        expected = cfd_contract(args.target, args.initializer)
+        if not args.no_resume:
+            for rank in range(args.workers):
+                select_resume_bundle(args.output_dir / "saved_models" / f"worker_{rank}", args.output_dir, expected)
     except (ValueError, OSError, ImportError, AttributeError) as error:
         parser.error(str(error))
     # Dependencies are also checked in the parent process, without creating Fluent.
@@ -516,7 +605,7 @@ def main(argv=None):
     mp.set_start_method("spawn", force=True)
     settings = {"output_dir": str(args.output_dir.resolve()), "target": args.target,
                 "initializer": args.initializer, "timesteps": args.timesteps,
-                "seed": args.seed}
+                "seed": args.seed, "resume": not args.no_resume}
     manager = SharedTrainingManager(args.workers)
     processes = []
     try:

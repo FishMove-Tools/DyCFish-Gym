@@ -22,7 +22,7 @@ def test_fifth_solver_failure_reaches_ppo_stop_signal(tmp_path):
             pass  # Do not serialize or train; exercise the actual step/stop logic.
 
     manager = Manager()
-    callback = Callback(str(tmp_path / "worker_0"), 0, manager)
+    callback = Callback(str(tmp_path / "worker_0"), 0, manager, {}, 0, {})
     for count in range(1, 6):
         callback.locals = {"rewards": [0.0], "dones": [True],
                            "infos": [{"failure_reason": "fluent_exception", "episode": {"r": 0.0}}]}
@@ -46,7 +46,7 @@ def test_non_solver_episode_breaks_consecutive_failure_count(tmp_path):
     class Callback(cfd.CallbackLogic, Base):
         def _save_checkpoint(self, *args):
             pass
-    callback = Callback(str(tmp_path / "worker"), 0, Manager())
+    callback = Callback(str(tmp_path / "worker"), 0, Manager(), {}, 0, {})
     for reason in ["fluent_exception"] * 4 + ["out_of_flow_domain"] + ["fluent_exception"]:
         callback.locals = {"rewards": [0], "dones": [True], "infos": [{"failure_reason": reason, "episode": {"r": 0.0}}]}
         assert callback._on_step()
