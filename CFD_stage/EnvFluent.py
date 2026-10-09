@@ -5,7 +5,6 @@ Only ``interface_profile='legacy'`` is supported here. The manuscript escape
 interface requires a separately validated CFD task, action mapping and reset
 procedure. See ``fluent_backend.py`` for the real case initialization contract.
 """
-
 from __future__ import annotations
 
 import csv
