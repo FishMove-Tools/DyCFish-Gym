@@ -15,7 +15,6 @@
   <img src="./assets/framework_figure/Framework.png" width="100%">
 </p>
 
-
 ### 🧠 Tech Stack / Tags
 
 ![](https://img.shields.io/badge/DeepRL-%23369FF7FF)  ![](https://img.shields.io/badge/BioRobotics-%23669FF7FF)  ![](https://img.shields.io/badge/CFD-%23766BF7FF)  ![](https://img.shields.io/badge/PPO-%23766BF7FF)  ![](https://img.shields.io/badge/ThunniformPropulsion-%23669FF7FF)  ![](https://img.shields.io/badge/Sim--to--Real-%2366BB66FF)  ![](https://img.shields.io/badge/GymEnv-%2366BB66FF)  ![](https://img.shields.io/badge/PyFluent-%23F7B93EFF)
