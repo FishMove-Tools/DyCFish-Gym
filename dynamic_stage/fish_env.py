@@ -1,465 +1,266 @@
-"""Gymnasium environment for a simplified fish escape task.
+"""Fish escape ROM aligned with manuscript Eqs. (2), (8)-(21).
 
-This module defines :class:`FishEnv`, a lightweight 2-D rigid-body
-simulation of a fish evading a pursuing predator.  Unlike the CFD stage
-(which couples to ANSYS Fluent), this environment uses an analytical
-dynamics model, making it suitable for rapid prototyping and large-scale
-training.
+Default action/observation/reward interfaces retain the supplied training setup.
+See model_notes.txt for parameter provenance and remaining manuscript ambiguities.
+Dependencies: numpy, gymnasium; pygame is only needed for rendering.
 """
-
 from __future__ import annotations
 
 import csv
 import math
-import os
-import random
-from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
 
 import gymnasium as gym
 import numpy as np
-import pygame
-import torch
 from gymnasium import spaces
-
-# Limit CPU parallelism if running on a multi-core machine.
-torch.set_num_threads(4)
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
 
 
 class FishEnv(gym.Env):
-    """2-D fish escape environment with a pursuing predator.
+    metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 30}
 
-    At the start of each episode a predator is spawned within a random
-    annular region around the fish.  The predator pursues at constant
-    speed.  The agent controls the fish's tail-beat amplitude and
-    frequency.  The episode terminates when the fish is captured, leaves
-    the domain, or survives until *max_steps*.
-    """
-
-    metadata = {
-        "render_modes": ["human", "rgb_array"],
-        "render_fps": 30,
-    }
-
-    def __init__(
-        self,
-        dt: float = 0.01,
-        max_steps: int = 2000,
-        render_mode: Optional[str] = "human",
-        predator_speed: float = 0.3,
-        capture_radius: float = 0.1,
-        render_skip: int = 10,
-        enable_step_logging: bool = False,
-    ) -> None:
+    def __init__(self, dt=0.01, max_steps=2000, render_mode="human",
+                 predator_speed=0.3, capture_radius=0.1, render_skip=10,
+                 enable_step_logging=False, *, mb=1.0, mt=0.2,
+                 Jb=0.005, Jt=0.001, r_t=0.3,
+                 mb0=None, mt0=None, kb=None, kt=None,
+                 action_mode="legacy_omega", log_dir="."):
         super().__init__()
-
-        # General parameters
-        self.dt = dt
-        self.max_steps = max_steps
-        self.render_mode = render_mode
-        self.render_skip = int(render_skip)
+        if render_mode not in (None, "human", "rgb_array"):
+            raise ValueError("Unsupported render_mode")
+        if action_mode not in ("legacy_omega", "paper_hz"):
+            raise ValueError("action_mode must be legacy_omega or paper_hz")
+        positive = (dt, mb, mt, Jb, Jt, r_t, capture_radius)
+        if not all(np.isfinite(x) and x > 0 for x in positive):
+            raise ValueError("dt, masses, inertias, r_t and capture_radius must be positive")
+        if int(max_steps) != max_steps or max_steps < 1:
+            raise ValueError("max_steps must be a positive integer")
+        if not np.isfinite(predator_speed) or predator_speed < 0:
+            raise ValueError("predator_speed must be finite and nonnegative")
+        supplied = (mb0, mt0, kb, kt)
+        if any(x is not None for x in supplied):
+            if any(x is None for x in supplied):
+                raise ValueError("Supply mb0, mt0, kb and kt together")
+            if not all(np.isfinite(x) and x > 0 for x in supplied):
+                raise ValueError("Eq. (8) requires positive actual masses and kb, kt")
+            mb, mt = (1 + kb) * mb0, (1 + kt) * mt0
+            if not np.isfinite(mb + mt):
+                raise ValueError("Equivalent masses overflowed")
+        self.mb0, self.mt0, self.kb, self.kt = supplied
+        # Eq. (8): mb and mt are EQUIVALENT masses, not necessarily dry masses.
+        self.mb, self.mt = float(mb), float(mt)
+        self.Jb, self.Jt, self.r_ = float(Jb), float(Jt), float(r_t)
+        self.dt, self.max_steps = float(dt), int(max_steps)
+        self.render_mode, self.render_skip = render_mode, max(1, int(render_skip))
+        self.predator_speed, self.capture_radius = float(predator_speed), float(capture_radius)
         self.enable_step_logging = bool(enable_step_logging)
-
-        # Fish body parameters
-        self.mb: float = 1.0    # body mass (kg)
-        self.Jb: float = 0.005  # body moment of inertia (kg·m²)
-        self.mt: float = 0.2    # tail mass (kg)
-        self.Jt: float = 0.001  # tail moment of inertia (kg·m²)
-        self.r_: float = 0.3    # tail-to-body-COM distance (m)
-
-        # Observation: [pos_x, pos_y, yaw, vbx, vby, wbz, time]
-        obs_high = np.array([100.0] * 7, dtype=np.float32)
-        self.observation_space = spaces.Box(
-            -obs_high, obs_high, dtype=np.float32,
-        )
-        # Action: [amplitude, angular_frequency]
-        self.action_space = spaces.Box(
-            low=np.array([0, math.pi]),
-            high=np.array([math.pi / 4, math.pi * 2]),
-            dtype=np.float32,
-        )
-
-        # State variables
-        self.pos = np.zeros(2, dtype=np.float32)
-        self.yaw: float = 0.0
-        self.Vb = np.zeros(3, dtype=np.float32)  # body-frame velocity
-        self.Wb = np.zeros(3, dtype=np.float32)  # body-frame angular velocity
-        self.time: float = 0.0
-        self.current_step: int = 0
-
-        # Predator state
-        self.predator_speed = float(predator_speed)
-        self.capture_radius = float(capture_radius)
-        self.predator_pos = np.zeros(2, dtype=np.float32)
-
-        # Logging control
-        self.episode_index: int = 0
-        self.episode_logged: bool = False
-        self._log_buffer: List[List[float]] = []
-
-        # Rendering
-        self.screen_dim: int = 600
-        self.scale: float = 100.0
-        self.screen: Optional[pygame.Surface] = None
-        self.clock: Optional[pygame.time.Clock] = None
-
-    # Gymnasium API
-
-    def reset(
-        self,
-        seed: Optional[int] = None,
-        options: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[np.ndarray, Dict[str, Any]]:
-        """Reset the environment and spawn a new predator position."""
-        super().reset(seed=seed)
-
-        self.pos[:] = 0.0
-        self.yaw = 0.0
-        self.Vb[:] = 0.0
-        self.Wb[:] = 0.0
-        self.time = 0.0
-        self.current_step = 0
+        self.log_dir = Path(log_dir) if log_dir is not None else None
+        self.action_mode = action_mode
+        # Table 1, Eqs. (9)-(10): lumped loads; no extra tail drag.
+        self.CFb = np.array([0.10, 0.13, 0.08], dtype=np.float64)
+        self.CMb = np.array([0.20, 0.23, 0.28], dtype=np.float64)
+        self.observation_space = spaces.Box(-np.inf, np.inf, shape=(7,), dtype=np.float32)
+        if action_mode == "legacy_omega":
+            low, high = [0, math.pi], [math.pi / 4, 2 * math.pi]
+        else:
+            low, high = [-math.pi / 4, 1], [math.pi / 4, 2]
+        self.action_space = spaces.Box(np.array(low, dtype=np.float32),
+                                       np.array(high, dtype=np.float32))
+        self.pos = np.zeros(2, dtype=np.float64)
+        self.Vb = np.zeros(3, dtype=np.float64)
+        self.Wb = np.zeros(3, dtype=np.float64)
+        self.predator_pos = np.zeros(2, dtype=np.float64)
+        self.yaw = self.time = self.A = 0.0
+        self.w = math.pi if action_mode == "legacy_omega" else 2 * math.pi
+        self.current_step = self.episode_index = 0
         self.episode_logged = False
+        self._done = False
         self._log_buffer = []
+        self.screen_dim, self.scale = 600, 100.0
+        self.screen = self.clock = None
 
-        # Spawn predator in a 0.5–1.0 m annular ring behind the fish
-        r = random.uniform(0.5, 1.0)
-        ang = random.uniform(1.5 * math.pi, 2 * math.pi)
-        self.predator_pos = self.pos + r * np.array(
-            [math.cos(ang), math.sin(ang)], dtype=np.float32,
-        )
-
+    def reset(self, *, seed=None, options=None):
+        super().reset(seed=seed)
+        self.pos.fill(0)
+        self.Vb.fill(0)
+        self.Wb.fill(0)
+        self.yaw = self.time = self.A = 0.0
+        self.w = math.pi if self.action_mode == "legacy_omega" else 2 * math.pi
+        self.current_step = 0
+        self.episode_logged = self._done = False
+        self._log_buffer = []
+        # Preserve the original fourth-quadrant spawn sector (not a full annulus).
+        radius = self.np_random.uniform(0.5, 1.0)
+        angle = self.np_random.uniform(1.5 * math.pi, 2 * math.pi)
+        self.predator_pos[:] = self.pos + radius * np.array([math.cos(angle), math.sin(angle)])
         return self._get_obs(), {}
 
-    def step(
-        self, action: np.ndarray,
-    ) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
-        """Advance the simulation by one control step.
+    def _tail_kinematics(self):
+        """Eq. (2), with A and omega held constant within each control step.
 
-        *action* is a two-element array ``[amplitude, angular_frequency]``.
+        Literal omega*t convention: changes of action may cause jumps. The
+        manuscript does not specify action-transition smoothing or phase memory.
         """
+        phase = self.w * self.time
+        theta = self.A * math.sin(phase)
+        dtheta = self.A * self.w * math.cos(phase)
+        ddtheta = -self.A * self.w**2 * math.sin(phase)
+        return theta, dtheta, ddtheta
+
+    def _dynamics_system(self):
+        """Positive planar mass matrix derived directly from Eqs. (17)-(21).
+
+        Unknown = [dVbx, dVby, dWbz]. With r=(rx,ry), p=e3 x r,
+        a_t = dVb + p*dWbz + b,
+        b = Omega_b x Vb + ddtheta*(e3 x r) - (Wbz+dtheta)^2*r.
+        """
+        theta, dtheta, ddtheta = self._tail_kinematics()
+        r = self.r_ * np.array([math.cos(theta), math.sin(theta)])
+        p = np.array([-r[1], r[0]])
+        u, v = self.Vb[:2]
+        omega = self.Wb[2]
+        transport = omega * np.array([-v, u])  # Omega_b, NOT Omega_t
+        b = transport + ddtheta * p - (omega + dtheta)**2 * r
+        drag = -0.5 * self.CFb[:2] * np.abs(self.Vb[:2]) * self.Vb[:2]
+        moment = -0.5 * self.CMb[2] * abs(omega) * omega
+        mass = np.array([
+            [self.mb + self.mt, 0, self.mt * p[0]],
+            [0, self.mb + self.mt, self.mt * p[1]],
+            [self.mt * p[0], self.mt * p[1], self.Jb + self.Jt + self.mt * self.r_**2],
+        ])
+        rhs = np.r_[drag - self.mb * transport - self.mt * b,
+                    moment - self.Jt * ddtheta - self.mt * np.dot(p, b)]
+        return mass, rhs
+
+    def _update_dynamics(self):
+        mass, rhs = self._dynamics_system()
+        acceleration = np.linalg.solve(mass, rhs)
+        # Eqs. (3)-(7), semi-implicit Euler; double precision internally.
+        self.Vb[:2] += acceleration[:2] * self.dt
+        self.Wb[2] += acceleration[2] * self.dt
+        self.Vb[2] = self.Wb[0] = self.Wb[1] = 0.0
+        self.yaw += self.Wb[2] * self.dt
+        self.pos += self._world_velocity() * self.dt
+        self.time += self.dt
+        if not np.all(np.isfinite(np.r_[self.pos, self.yaw, self.Vb, self.Wb])):
+            raise FloatingPointError("Nonfinite ROM state; check parameters and dt")
+        if self.enable_step_logging:
+            self._log_buffer.append([*self.pos, self.yaw, *self.Vb[:2], self.Wb[2]])
+
+    def _world_velocity(self):
+        c, s = math.cos(self.yaw), math.sin(self.yaw)
+        return np.array([c * self.Vb[0] - s * self.Vb[1],
+                         s * self.Vb[0] + c * self.Vb[1]])
+
+    def _get_obs(self):
+        return np.array([*self.pos, self.yaw, *self.Vb[:2], self.Wb[2], self.time], dtype=np.float32)
+
+    def step(self, action):
+        if self._done:
+            raise RuntimeError("Episode is finished; call reset()")
+        action = np.asarray(action, dtype=np.float64)
+        if action.shape != (2,) or not np.all(np.isfinite(action)):
+            raise ValueError("Action must contain two finite numbers")
+        # Permit float32 endpoint rounding only; do not silently clip invalid actions.
+        low = self.action_space.low.astype(np.float64)
+        high = self.action_space.high.astype(np.float64)
+        if np.any(action < low - 1e-6) or np.any(action > high + 1e-6):
+            raise ValueError("Action is outside action_space")
+        action = np.clip(action, self.action_space.low, self.action_space.high)
         self.A = float(action[0])
-        self.w = float(action[1])
-
-        # Advance rigid-body dynamics
+        self.w = float(action[1]) * (2 * math.pi if self.action_mode == "paper_hz" else 1)
         self._update_dynamics()
-
-        # Predator pursuit
-        vec_pf = self.pos - self.predator_pos
-        dist_pf = float(np.linalg.norm(vec_pf))
-        if dist_pf > 1e-8:
-            self.predator_pos += (
-                (vec_pf / dist_pf) * self.predator_speed * self.dt
-            )
-        else:
-            # Add small jitter to break degeneracy when coincident
-            jitter = (np.random.rand(2) - 0.5) * 1e-3
-            self.predator_pos += jitter.astype(np.float32)
-            dist_pf = 0.0
-
-        # Reward shaping
-        cos_yaw = math.cos(self.yaw)
-        sin_yaw = math.sin(self.yaw)
-        vx_world = cos_yaw * self.Vb[0] - sin_yaw * self.Vb[1]
-        vy_world = sin_yaw * self.Vb[0] + cos_yaw * self.Vb[1]
-
-        unit_away = (
-            (vec_pf / (dist_pf + 1e-8)) if dist_pf > 0
-            else np.zeros(2, dtype=np.float32)
-        )
-        v_away = vx_world * unit_away[0] + vy_world * unit_away[1]
-
-        # Reward coefficients
-        r_live = 0.02
-        k_dist, k_vx, k_away = 0.2, 0.3, 0.5
-        k_vy, k_wz = 0.15, 0.05
-        k_a_reg, k_w_reg = 0.002, 0.0005
-
-        reward = 0.0
-        reward += r_live
-        reward += k_dist * min(dist_pf, 1.5)
-        reward += k_vx * max(0.0, vx_world)
-        reward += k_away * max(0.0, v_away)
-        reward -= k_vy * abs(vy_world)
-        reward -= k_wz * abs(self.Wb[2])
-        reward -= k_a_reg * (self.A ** 2)
-        reward -= k_w_reg * (self.w ** 2)
-
-        terminated = False
-        truncated = False
-        reason: Optional[str] = None
-
-        # Capture termination
-        if dist_pf <= self.capture_radius:
-            terminated = True
-            reward -= 50.0
-            reason = "captured"
-
-        # Out-of-bounds termination
-        if not terminated and (abs(self.pos[0]) > 50 or abs(self.pos[1]) > 50):
-            terminated = True
-            reward -= 10.0
-            reason = "out_of_bounds"
-
+        vec = self.pos - self.predator_pos
+        distance = float(np.linalg.norm(vec))
+        if distance > 0:
+            self.predator_pos += vec / distance * min(distance, self.predator_speed * self.dt)
+        # Evaluate capture and reward at the returned state, after predator motion.
+        vec = self.pos - self.predator_pos
+        distance = float(np.linalg.norm(vec))
+        away = vec / distance if distance > 0 else np.zeros(2)
+        velocity = self._world_velocity()
+        reward = (0.02 + 0.2 * min(distance, 1.5)
+                  + 0.3 * max(0.0, velocity[0]) + 0.5 * max(0.0, float(velocity @ away))
+                  - 0.15 * abs(velocity[1]) - 0.05 * abs(self.Wb[2])
+                  - 0.002 * self.A**2 - 0.0005 * self.w**2)
         self.current_step += 1
-
-        # Survival success
-        if not terminated and self.current_step >= self.max_steps:
-            terminated = True
-            reward += 100.0
-            reason = "timeout_survive"
-
-        # Throttled rendering in human mode
-        if (
-            self.render_mode == "human"
-            and (self.current_step % max(1, self.render_skip) == 0)
-        ):
+        reason = None
+        if distance <= self.capture_radius:
+            reason, reward = "captured", reward - 50.0
+        elif np.any(np.abs(self.pos) > 50):
+            reason, reward = "out_of_bounds", reward - 10.0
+        elif self.current_step >= self.max_steps:
+            # Preserved finite-horizon survival objective, with time observed.
+            reason, reward = "timeout_survive", reward + 100.0
+        terminated = reason is not None
+        self._done = terminated
+        if self.render_mode == "human" and self.current_step % self.render_skip == 0:
             self.render()
-
-        # Log episode outcome (once per episode)
         if terminated and not self.episode_logged:
-            success = reason == "timeout_survive"
-            self._log_episode_outcome(
-                success=success,
-                steps=self.current_step,
-                reason=reason or "none",
-            )
+            self._log_episode_outcome(reason == "timeout_survive", self.current_step, reason)
             self._flush_step_buffer()
             self.episode_logged = True
             self.episode_index += 1
+        return self._get_obs(), float(reward), terminated, False, {
+            "reason": reason, "predator_distance": distance,
+            "predator_pos": self.predator_pos.copy(),
+        }
 
-        return self._get_obs(), reward, terminated, False, {}
-
-    def close(self) -> None:
-        """Release Pygame resources."""
-        if self.screen is not None:
-            pygame.display.quit()
-            pygame.quit()
-
-    # Observation
-
-    def _get_obs(self) -> np.ndarray:
-        """Return the current observation vector."""
-        return np.array(
-            [
-                self.pos[0], self.pos[1], self.yaw,
-                self.Vb[0], self.Vb[1], self.Wb[2], self.time,
-            ],
-            dtype=np.float32,
-        )
-
-    # Rigid-body dynamics
-
-    def _update_dynamics(self) -> None:
-        """Integrate the fish + tail rigid-body equations for one time-step."""
-        dt = self.dt
-        t = self.time
-
-        # Tail kinematics
-        theta = self.A * math.cos(self.w * t)
-        dtheta = -self.w * self.A * math.sin(self.w * t)
-        ddtheta = -(self.w ** 2) * self.A * math.cos(self.w * t)
-
-        r_bt = self.r_ * np.array(
-            [math.cos(theta), math.sin(theta), 0.0],
-        )
-        Wt = self.Wb + dtheta * np.array([0, 0, 1])
-        Vt = self.Vb + np.cross(Wt, r_bt)
-
-        # Drag forces / moments on the body
-        CFb = 10 * np.array([0.1, 0.01, 0])
-        Fdb = -0.5 * CFb * np.sign(self.Vb) * (self.Vb ** 2)
-        CMb = np.array([0, 0, 1])
-        Mdb = -0.5 * CMb * np.sign(self.Wb) * (self.Wb ** 2)
-
-        # Drag forces on the tail
-        CFt = np.array([0.1, 0.1, 0.1])
-        Fdt = -0.5 * CFt * np.sign(Vt) * (Vt ** 2)
-
-        # Coupling forces and moments
-        F1 = self.mt * (
-            np.cross(r_bt, ddtheta * np.array([0, 0, 1]))
-            - np.cross(Wt, self.Vb)
-            - np.cross(Wt, np.cross(Wt, r_bt))
-        )
-        M1 = (
-            -self.Jt * ddtheta * np.array([0, 0, 1])
-            - np.cross(Wt, self.Jt * Wt)
-            + np.cross(r_bt, F1)
-        )
-
-        K = np.concatenate([
-            self.mb * np.cross(self.Wb, self.Vb) - F1 - Fdb,
-            np.cross(self.Wb, self.Jb * self.Wb) - M1 - Mdb,
-        ])
-
-        # Construct the mass matrix and solve
-        r_bt_cross = np.array([
-            [0, -r_bt[2], r_bt[1]],
-            [r_bt[2], 0, -r_bt[0]],
-            [-r_bt[1], r_bt[0], 0],
-        ])
-        H = np.block([
-            [
-                -(self.mt + self.mb) * np.eye(3),
-                self.mt * r_bt_cross,
-            ],
-            [
-                -self.mt * r_bt_cross,
-                -(self.Jt + self.Jb) * np.eye(3)
-                + self.mt * (r_bt_cross @ r_bt_cross),
-            ],
-        ])
-        # Regularise for numerical stability
-        H_reg = H + 1e-8 * np.eye(6)
-        U = np.linalg.solve(H_reg, K)
-        dVb, dWb = U[:3], U[3:]
-
-        # Semi-implicit Euler integration
-        self.Vb += dVb * dt
-        self.Wb += dWb * dt
-        self.yaw += self.Wb[2] * dt
-
-        cos_yaw = math.cos(self.yaw)
-        sin_yaw = math.sin(self.yaw)
-        vx_world = cos_yaw * self.Vb[0] - sin_yaw * self.Vb[1]
-        vy_world = sin_yaw * self.Vb[0] + cos_yaw * self.Vb[1]
-        self.pos[0] += vx_world * dt
-        self.pos[1] += vy_world * dt
-
-        # Buffer per-step state if logging is enabled
-        if self.enable_step_logging:
-            self._log_buffer.append([
-                self.pos[0], self.pos[1], self.yaw,
-                self.Vb[0], self.Vb[1], self.Wb[2],
-            ])
-
-        self.time += dt
-
-    # Logging utilities
-
-    def _flush_step_buffer(self) -> None:
-        """Write the accumulated per-step buffer to disk (batch I/O)."""
-        if not self._log_buffer:
+    def _write_rows(self, filename, header, rows):
+        if self.log_dir is None:
             return
-        header_needed = not os.path.exists("varable_record.txt")
-        with open(
-            "varable_record.txt", "a", encoding="utf-8", newline=""
-        ) as f:
-            w = csv.writer(f)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        path = self.log_dir / filename
+        header_needed = not path.exists() or path.stat().st_size == 0
+        with path.open("a", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
             if header_needed:
-                w.writerow(["posx", "posy", "yaw", "Vbx", "Vby", "Wbz"])
-            w.writerows(self._log_buffer)
-        self._log_buffer = []
+                writer.writerow(header)
+            writer.writerows(rows)
 
-    def _log_episode_outcome(
-        self, success: bool, steps: int, reason: str,
-    ) -> None:
-        """Append one row to the episode-outcomes CSV."""
-        header_needed = not os.path.exists("episode_outcomes.csv")
-        with open(
-            "episode_outcomes.csv", "a", encoding="utf-8", newline=""
-        ) as f:
-            w = csv.writer(f)
-            if header_needed:
-                w.writerow(["episode", "success", "steps", "reason"])
-            w.writerow([
-                self.episode_index, bool(success), int(steps), str(reason),
-            ])
+    def _flush_step_buffer(self):
+        if self._log_buffer:
+            self._write_rows("varable_record.txt", ["posx", "posy", "yaw", "Vbx", "Vby", "Wbz"], self._log_buffer)
+            self._log_buffer = []
 
-    # Rendering (Pygame)
-    def render(self) -> Optional[np.ndarray]:
-        """Render the current state via Pygame; returns an RGB frame in
-        ``rgb_array`` mode, ``None`` otherwise.
-        """
+    def _log_episode_outcome(self, success, steps, reason):
+        self._write_rows("episode_outcomes.csv", ["episode", "success", "steps", "reason"],
+                         [[self.episode_index, bool(success), int(steps), reason]])
+
+    def render(self):
         if self.render_mode is None:
             return None
-
+        import pygame
         if self.screen is None:
-            pygame.init()
-            pygame.display.init()
-            self.screen = pygame.display.set_mode(
-                (self.screen_dim, self.screen_dim),
-            )
-            self.clock = pygame.time.Clock()
-
-        if self.clock is None:
-            self.clock = pygame.time.Clock()
-
+            if self.render_mode == "human":
+                pygame.display.init()
+                self.screen = pygame.display.set_mode((self.screen_dim, self.screen_dim))
+                self.clock = pygame.time.Clock()
+            else:
+                self.screen = pygame.Surface((self.screen_dim, self.screen_dim))
         self.screen.fill((255, 255, 255))
-
-        # Reference crosshairs
-        cx = self.screen_dim // 2
-        cy = self.screen_dim // 2
-        pygame.draw.line(
-            self.screen, (200, 200, 200), (cx, 0), (cx, self.screen_dim), 1,
-        )
-        pygame.draw.line(
-            self.screen, (200, 200, 200), (0, cy), (self.screen_dim, cy), 1,
-        )
-
-        # Fish body polygon
-        body_poly = np.array(
-            [[-0.25, -0.1], [0.25, -0.1], [0.25, 0.1], [-0.25, 0.1]],
-            dtype=np.float32,
-        )
-        tail_poly = np.array(
-            [[0.0, -0.05], [0.3, -0.05], [0.3, 0.05], [0.0, 0.05]],
-            dtype=np.float32,
-        )
-        theta = self.A * math.cos(self.w * self.time)
-
-        cos_yaw = math.cos(self.yaw)
-        sin_yaw = math.sin(self.yaw)
-        R_body = np.array(
-            [[cos_yaw, -sin_yaw], [sin_yaw, cos_yaw]], dtype=np.float32,
-        )
-        body_world = (R_body @ body_poly.T).T * self.scale
-        body_world[:, 0] += self.pos[0] * self.scale + cx
-        body_world[:, 1] += self.pos[1] * self.scale + cy
-
-        cos_t = math.cos(theta)
-        sin_t = math.sin(theta)
-        R_tail_local = np.array(
-            [[cos_t, -sin_t], [sin_t, cos_t]], dtype=np.float32,
-        )
-        tail_world = (R_tail_local @ tail_poly.T).T
-        tail_base_body = np.array([0.25, 0.0], dtype=np.float32)
-        tail_base_world = (R_body @ tail_base_body) * self.scale
-        tail_world *= self.scale
-        tail_world[:, 0] += tail_base_world[0] + self.pos[0] * self.scale + cx
-        tail_world[:, 1] += tail_base_world[1] + self.pos[1] * self.scale + cy
-
-        pygame.draw.polygon(
-            self.screen, (0, 0, 255),
-            np.round(body_world).astype(np.int32),
-        )
-        pygame.draw.polygon(
-            self.screen, (255, 0, 0),
-            np.round(tail_world).astype(np.int32),
-        )
-
-        # Predator marker
-        pred_px = int(self.predator_pos[0] * self.scale + cx)
-        pred_py = int(self.predator_pos[1] * self.scale + cy)
-        pygame.draw.circle(self.screen, (255, 0, 0), (pred_px, pred_py), 5)
-        try:
-            font = pygame.font.SysFont(None, 18)
-            label = font.render("predator", True, (0, 0, 0))
-            self.screen.blit(label, (pred_px + 6, pred_py - 6))
-        except Exception:
-            pass
-
+        center = np.array([self.screen_dim / 2, self.screen_dim / 2])
+        def pixels(points):
+            return np.rint(center + np.asarray(points) * [self.scale, -self.scale]).astype(int)
+        def rotation(angle):
+            return np.array([[math.cos(angle), -math.sin(angle)], [math.sin(angle), math.cos(angle)]])
+        rb = rotation(self.yaw)
+        theta, _, _ = self._tail_kinematics()
+        # Schematic only: modeled origin is also the hinge in Eqs. (15)-(17).
+        body = np.array([[-0.5, -0.10], [0, -0.10], [0, 0.10], [-0.5, 0.10]])
+        tail = np.array([[0, -0.04], [2*self.r_, -0.04], [2*self.r_, 0.04], [0, 0.04]])
+        pygame.draw.polygon(self.screen, (35, 105, 210), pixels(body @ rb.T + self.pos))
+        pygame.draw.polygon(self.screen, (235, 135, 35), pixels(tail @ rotation(self.yaw + theta).T + self.pos))
+        pygame.draw.circle(self.screen, (20, 20, 20), pixels(self.pos), 3)
+        pygame.draw.circle(self.screen, (210, 45, 60), pixels(self.predator_pos), 5)
         if self.render_mode == "human":
             pygame.event.pump()
             pygame.display.flip()
             self.clock.tick(self.metadata["render_fps"])
             return None
+        return np.transpose(pygame.surfarray.array3d(self.screen), (1, 0, 2)).copy()
 
-        elif self.render_mode == "rgb_array":
-            arr = pygame.surfarray.array3d(self.screen)
-            return np.transpose(arr, axes=(1, 0, 2))
-
-        return None
+    def close(self):
+        if self.screen is not None and self.render_mode == "human":
+            import pygame
+            pygame.display.quit()
+        self.screen = self.clock = None
